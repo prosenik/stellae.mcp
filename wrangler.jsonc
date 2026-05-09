@@ -1,0 +1,32 @@
+{
+  "name": "brain-stellae",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-01-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "brain-stellae",
+      "database_id": "94843f34-c4a5-441a-88f2-0f913e3490a0"
+    }
+  ],
+
+  "routes": [
+    {
+      "pattern": "brain.stellae.studio",
+      "custom_domain": true
+    }
+  ],
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["BrainMCP"]
+    },
+    {
+      "tag": "v2",
+      "deleted_classes": ["BrainMCP"]
+    }
+  ]
+}
