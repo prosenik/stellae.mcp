@@ -3,6 +3,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-01-01",
   "compatibility_flags": ["nodejs_compat"],
+  "account_id": "5a53dda39f7f2d80b496dd5064363233",
 
   "d1_databases": [
     {
@@ -14,7 +15,7 @@
 
   "routes": [
     {
-      "pattern": "brain.stellae.studio",
+      "pattern": "mcp.stellae.studio",
       "custom_domain": true
     }
   ],

@@ -19,7 +19,7 @@ interface Memory {
 
 function buildServer(env: Env): McpServer {
   const server = new McpServer({
-    name: "brain.stellae.studio",
+    name: "mcp.stellae.studio",
     version: "1.0.0",
   });
 
@@ -221,7 +221,7 @@ function loginPage(error = false): Response {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>brain.stellae.studio</title>
+  <title>mcp.stellae.studio</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #0a0a0a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
@@ -237,7 +237,7 @@ function loginPage(error = false): Response {
 </head>
 <body>
   <div class="card">
-    <h1>brain.stellae.studio</h1>
+    <h1>mcp.stellae.studio</h1>
     <p>Enter your API key to access memories.</p>
     ${error ? '<p class="error">Invalid key. Try again.</p>' : ''}
     <form method="POST" action="/login">
@@ -284,7 +284,7 @@ function dashboardPage(memories: Memory[]): Response {
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>brain.stellae.studio</title>
+  <title>mcp.stellae.studio</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body { background: #0a0a0a; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 40px 24px; }
@@ -321,7 +321,7 @@ function dashboardPage(memories: Memory[]): Response {
 </head>
 <body>
   <header>
-    <h1>brain.stellae.studio</h1>
+    <h1>mcp.stellae.studio</h1>
     <a href="/logout" class="logout">Sign out</a>
   </header>
   <div class="search-bar"><input type="search" placeholder="Search memories…" /></div>
