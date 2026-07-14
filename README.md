@@ -4,6 +4,8 @@ A personal memory MCP server for Stellae Studio — deployed on Cloudflare Worke
 
 Accessible at `mcp.stellae.studio`.
 
+> 📋 **Where this is heading:** see [docs/BRAIN-ANALYSIS.md](docs/BRAIN-ANALYSIS.md) — a full gap analysis and prioritised roadmap for turning this into the brain for all agency and private work.
+
 ---
 
 ## What it does
