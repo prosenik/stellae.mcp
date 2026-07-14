@@ -169,26 +169,44 @@ CREATE TABLE api_keys (
 | `list_review_queue` | Memories past `review_after` or stale — powers a periodic brain-gardening session |
 | `export_memories` | Full JSON dump for backup/portability |
 
-## 5. Prioritised roadmap
+## 5. Prioritised roadmap — with model recommendations
 
-**Now (this makes the brain safe to fill):**
-1. Workspaces + scoped API keys (2.1, security table in 2.6)
-2. Header-only auth, session-token dashboard cookie, timing-safe compare
-3. Versioned migrations + scheduled D1 backup to R2
-4. `tags`, `importance`, `status` columns; `archive_memory`
+Each task carries a recommended implementation model. The routing rule:
 
-**Next (this makes the brain good at its job):**
-5. FTS5 search
-6. Tiered, scoped `get_briefing` with token budget
-7. `decision`, `client`, `task`, `note` types + `log_decision`
-8. Edit history; review queue + `review_after`
-9. CI (typecheck) + basic integration tests
+> **Anything touching auth/privacy or the briefing intelligence → Claude Fable 5.
+> Anything with a clear spec that follows existing patterns → Claude Opus 4.8.**
 
-**Later (this makes the brain grow on its own):**
-10. Semantic search (Vectorize + Workers AI)
-11. Ingestion webhooks with pending-approval flow
-12. Scheduled distillation cron
-13. Per-agent briefing profiles; changelog bridge; recall-usage analytics
+Rationale (as of July 2026): Fable 5 clearly leads on long, complex, multi-stage work (80.3% vs 69.2% SWE-Bench Pro) but costs ~2× Opus 4.8, and the gap narrows sharply on well-scoped routine tasks. Since this document already specifies most tasks in detail, the cheaper model has a marked trail to follow. Scope each session to a single numbered task and reference this doc explicitly, e.g. _"Implement task 4 exactly as specified in docs/BRAIN-ANALYSIS.md §3."_
+
+### Now — makes the brain safe to fill
+
+| # | Task | Model | Why this model |
+|---|---|---|---|
+| 1 | Workspaces + scoped API keys (§2.1, §2.6) | **Fable 5** | Security architecture with cross-cutting changes (schema, auth, every tool). A subtle mistake leaks private data. |
+| 2 | Auth hardening: header-only auth, session-token cookie, timing-safe compare (§2.6) | **Fable 5** | Security-critical; failure mode is silent. Pair with task 1 in one session. |
+| 3 | Versioned migrations + scheduled D1 backup to R2 (§2.7) | Opus 4.8 | Well-documented Wrangler patterns, low ambiguity. |
+| 4 | `tags`, `importance`, `status` columns + `archive_memory` (§2.4, §3) | Opus 4.8 | Mechanical schema + CRUD work with a complete spec above. |
+
+### Next — makes the brain good at its job
+
+| # | Task | Model | Why this model |
+|---|---|---|---|
+| 5 | FTS5 search (§2.3) | Opus 4.8 | Standard SQLite feature; the trigger-sync setup needs care but is documented territory. |
+| 6 | Tiered, scoped `get_briefing` with token budget (§2.2) | **Fable 5** | The product-design heart of the brain — ranking, tiering, budgeting. Quality here decides daily usefulness. |
+| 7 | `decision` / `client` / `task` / `note` types + `log_decision` (§2.4, §4) | Opus 4.8 | Additive; follows existing tool patterns exactly. |
+| 8 | Edit history (`memory_versions`) + review queue + `review_after` (§2.4, §2.5) | Opus 4.8 | Clear spec, moderate complexity. |
+| 9 | CI (typecheck) + basic integration tests (§2.7) | Opus 4.8 | Boilerplate GitHub Actions + test scaffolding. A smaller model (Haiku) also works. |
+
+### Later — makes the brain grow on its own
+
+| # | Task | Model | Why this model |
+|---|---|---|---|
+| 10 | Semantic search: Vectorize + Workers AI embeddings (§2.3) | **Fable 5** | Multi-service integration, embedding strategy, hybrid ranking with FTS5 — genuinely hard to get right. |
+| 11 | Ingestion webhooks with pending-approval flow (§2.8) | **Fable 5** | New attack surface + workflow design; security and UX judgment both matter. |
+| 12 | Scheduled distillation cron (§2.5) | **Fable 5** | Bad distillation silently corrupts the brain — the summarisation logic is the risky part. |
+| 13 | Per-agent briefing profiles, changelog bridge, recall-usage analytics (§2.8) | Opus 4.8 | Mostly plumbing once tasks 1–12 exist. |
+
+_Model names refer to the lineup as of July 2026 — revisit these picks when the lineup changes. The principle outlives the models: route design-heavy, security-critical, or open-ended work to the strongest model; route well-specified pattern-following work to the cheaper one._
 
 ---
 
