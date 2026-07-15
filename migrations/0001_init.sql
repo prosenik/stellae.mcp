@@ -1,3 +1,6 @@
+-- Baseline v1 schema.
+-- Guarded with IF NOT EXISTS so this migration is a no-op on databases
+-- that were originally created from the old schema.sql.
 CREATE TABLE IF NOT EXISTS memories (
   id TEXT PRIMARY KEY,
   type TEXT NOT NULL CHECK(type IN ('user', 'project', 'feedback', 'reference')),
