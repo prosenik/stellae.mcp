@@ -19,6 +19,9 @@ export default defineWorkersConfig(async () => {
       poolOptions: {
         workers: {
           singleWorker: true,
+          // Shared storage across tests (fixtures use unique IDs). Stacked
+          // isolation breaks on waitUntil writes + the ratelimit binding.
+          isolatedStorage: false,
           wrangler: { configPath: "./wrangler.jsonc" },
           miniflare: {
             bindings: {

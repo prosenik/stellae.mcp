@@ -97,7 +97,9 @@ Two kinds of keys:
 - **Master key** — the `API_KEY` environment variable set in Cloudflare. Full access to every workspace + key management. Kept for migration compatibility; will be retired once all consumers use scoped keys.
 - **Scoped keys** — per-consumer keys stored (SHA-256 hashed) in D1. Each key is bound to the workspaces it may read/write and can be read-only. Revocable individually.
 
-Pass either as `Authorization: Bearer <key>` header or `?key=<key>` query param (query param support will be removed in the auth-hardening task). The dashboard uses a cookie-based session after login at `mcp.stellae.studio` and shows only the memories the key can read.
+**MCP / API auth is `Authorization: Bearer <key>` only.** Query-param auth (`?key=`) was removed — keys in URLs leak into logs, analytics, and browser history.
+
+The dashboard at `mcp.stellae.studio` logs in with a key but stores only a random session token in the cookie (30-day expiry, hash stored server-side). Revoking a key immediately invalidates its sessions. Login attempts are rate-limited to 5/minute per IP.
 
 ### Key management (master key only)
 
