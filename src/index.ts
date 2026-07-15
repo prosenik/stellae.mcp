@@ -2,9 +2,15 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 
+// Workers rate-limiting binding (configured in wrangler.jsonc).
+interface RateLimit {
+  limit(options: { key: string }): Promise<{ success: boolean }>;
+}
+
 interface Env {
   DB: D1Database;
   API_KEY: string;
+  LOGIN_RATE_LIMITER?: RateLimit;
 }
 
 interface Memory {
@@ -31,11 +37,22 @@ interface ApiKeyRow {
 
 // The identity behind a request, resolved from its API key.
 interface Caller {
+  keyId: string; // 'master' or api_keys.id — referenced by dashboard sessions
   label: string;
   workspaces: string[]; // ["*"] = every workspace
   canWrite: boolean;
   isAdmin: boolean; // true only for the master API_KEY — unlocks /admin/keys
 }
+
+interface SessionRow {
+  id: string;
+  token_hash: string;
+  key_id: string;
+  created_at: string;
+  expires_at: string;
+}
+
+const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 const WORKSPACE_RE = /^(private|agency|client:[a-z0-9][a-z0-9-]*)$/;
 
@@ -55,10 +72,25 @@ function generateApiKey(): string {
   return `brain_${b64}`;
 }
 
+// Constant-time secret comparison. Hashing first normalises lengths, so
+// timingSafeEqual never throws and the comparison leaks nothing about
+// where the strings diverge.
+async function timingSafeEqualStr(a: string, b: string): Promise<boolean> {
+  const enc = new TextEncoder();
+  const [da, db] = await Promise.all([
+    crypto.subtle.digest("SHA-256", enc.encode(a)),
+    crypto.subtle.digest("SHA-256", enc.encode(b)),
+  ]);
+  // Workers-specific extension — not in the standard SubtleCrypto surface.
+  return (crypto.subtle as SubtleCrypto & {
+    timingSafeEqual(x: ArrayBuffer, y: ArrayBuffer): boolean;
+  }).timingSafeEqual(da, db);
+}
+
 async function resolveCaller(token: string, env: Env, ctx: ExecutionContext): Promise<Caller | null> {
   // Master key keeps working during the migration to scoped keys (Task 1 DoD).
-  if (token === env.API_KEY) {
-    return { label: "master", workspaces: ["*"], canWrite: true, isAdmin: true };
+  if (await timingSafeEqualStr(token, env.API_KEY)) {
+    return { keyId: "master", label: "master", workspaces: ["*"], canWrite: true, isAdmin: true };
   }
 
   const hash = await sha256Hex(token);
@@ -83,7 +115,76 @@ async function resolveCaller(token: string, env: Env, ctx: ExecutionContext): Pr
   }
   if (!Array.isArray(workspaces) || workspaces.length === 0) return null;
 
-  return { label: row.label, workspaces, canWrite: row.can_write === 1, isAdmin: false };
+  return { keyId: row.id, label: row.label, workspaces, canWrite: row.can_write === 1, isAdmin: false };
+}
+
+// Rebuild a Caller from a stored key id — used by dashboard sessions so that
+// revoking a key immediately invalidates its sessions.
+async function resolveCallerByKeyId(keyId: string, env: Env): Promise<Caller | null> {
+  if (keyId === "master") {
+    return { keyId: "master", label: "master", workspaces: ["*"], canWrite: true, isAdmin: true };
+  }
+  const row = await env.DB.prepare(
+    "SELECT * FROM api_keys WHERE id = ? AND revoked_at IS NULL"
+  )
+    .bind(keyId)
+    .first<ApiKeyRow>();
+  if (!row) return null;
+  let workspaces: string[];
+  try {
+    workspaces = JSON.parse(row.workspaces);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(workspaces) || workspaces.length === 0) return null;
+  return { keyId: row.id, label: row.label, workspaces, canWrite: row.can_write === 1, isAdmin: false };
+}
+
+// ── Dashboard sessions ────────────────────────────────────────────────────────
+// The cookie carries a random token; only its hash is stored server-side.
+// The raw API key never touches a cookie.
+
+function generateSessionToken(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  const b64 = btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+  return `sess_${b64}`;
+}
+
+async function createSession(keyId: string, env: Env, ctx: ExecutionContext): Promise<string> {
+  const token = generateSessionToken();
+  const now = new Date();
+  const expires = new Date(now.getTime() + SESSION_TTL_SECONDS * 1000);
+  await env.DB.prepare(
+    "INSERT INTO sessions (id, token_hash, key_id, created_at, expires_at) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(crypto.randomUUID(), await sha256Hex(token), keyId, now.toISOString(), expires.toISOString())
+    .run();
+
+  // Opportunistic cleanup of expired sessions.
+  ctx.waitUntil(
+    env.DB.prepare("DELETE FROM sessions WHERE expires_at < ?").bind(now.toISOString()).run()
+  );
+
+  return token;
+}
+
+async function resolveSession(token: string, env: Env): Promise<Caller | null> {
+  const row = await env.DB.prepare(
+    "SELECT * FROM sessions WHERE token_hash = ? AND expires_at > ?"
+  )
+    .bind(await sha256Hex(token), new Date().toISOString())
+    .first<SessionRow>();
+  if (!row) return null;
+  return resolveCallerByKeyId(row.key_id, env);
+}
+
+async function destroySession(token: string, env: Env): Promise<void> {
+  await env.DB.prepare("DELETE FROM sessions WHERE token_hash = ?")
+    .bind(await sha256Hex(token))
+    .run();
 }
 
 // SQL fragment restricting a query to the caller's readable workspaces.
@@ -597,23 +698,39 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
-    // ── Dashboard routes (cookie-auth) ────────────────────────────────────
+    // ── Dashboard routes (session-cookie auth) ────────────────────────────
+    // The cookie holds a random session token — never the API key. The old
+    // brain_key cookie (which stored the raw key) is actively expired.
     const cookie = request.headers.get("Cookie") ?? "";
-    const sessionKey = cookie.match(/brain_key=([^;]+)/)?.[1];
+    const sessionToken = cookie.match(/brain_session=([^;]+)/)?.[1];
+    const CLEAR_LEGACY_COOKIE = "brain_key=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0";
 
     if (url.pathname === "/login") {
       if (request.method === "POST") {
+        // Rate-limit login attempts per client IP before touching the key.
+        if (env.LOGIN_RATE_LIMITER) {
+          const ip = request.headers.get("CF-Connecting-IP") ?? "unknown";
+          const { success } = await env.LOGIN_RATE_LIMITER.limit({ key: ip });
+          if (!success) {
+            return new Response("Too many login attempts. Try again in a minute.", {
+              status: 429,
+              headers: { "Content-Type": "text/plain", "Retry-After": "60" },
+            });
+          }
+        }
+
         const body = await request.formData();
         const key = body.get("key")?.toString() ?? "";
         const caller = key ? await resolveCaller(key, env, ctx) : null;
         if (caller) {
-          return new Response(null, {
-            status: 302,
-            headers: {
-              "Location": "/",
-              "Set-Cookie": `brain_key=${encodeURIComponent(key)}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`,
-            },
-          });
+          const token = await createSession(caller.keyId, env, ctx);
+          const headers = new Headers({ "Location": "/" });
+          headers.append(
+            "Set-Cookie",
+            `brain_session=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`
+          );
+          headers.append("Set-Cookie", CLEAR_LEGACY_COOKIE);
+          return new Response(null, { status: 302, headers });
         }
         return loginPage(true);
       }
@@ -621,17 +738,15 @@ export default {
     }
 
     if (url.pathname === "/logout") {
-      return new Response(null, {
-        status: 302,
-        headers: {
-          "Location": "/",
-          "Set-Cookie": "brain_key=; Path=/; Max-Age=0",
-        },
-      });
+      if (sessionToken) ctx.waitUntil(destroySession(sessionToken, env));
+      const headers = new Headers({ "Location": "/" });
+      headers.append("Set-Cookie", "brain_session=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0");
+      headers.append("Set-Cookie", CLEAR_LEGACY_COOKIE);
+      return new Response(null, { status: 302, headers });
     }
 
     if (url.pathname === "/" || url.pathname === "/dashboard") {
-      const caller = sessionKey ? await resolveCaller(decodeURIComponent(sessionKey), env, ctx) : null;
+      const caller = sessionToken ? await resolveSession(sessionToken, env) : null;
       if (!caller) return loginPage();
       const scope = scopeFilter(caller);
       const { results } = await env.DB.prepare(
@@ -642,27 +757,17 @@ export default {
       return dashboardPage(results, caller);
     }
 
-    // ── MCP & API routes (bearer/query-param auth) ────────────────────────
+    // ── MCP & API routes (Bearer-header auth ONLY) ────────────────────────
+    // Query-param auth is gone: keys in URLs leak into logs, analytics, and
+    // browser history. No CORS headers either — MCP consumers are servers
+    // and native clients, not browsers, and the dashboard is same-origin.
     const authHeader = request.headers.get("Authorization");
-    const headerToken = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
-    const queryToken = url.searchParams.get("key");
-    const token = headerToken ?? queryToken;
+    const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
     const caller = token ? await resolveCaller(token, env, ctx) : null;
     if (!caller) {
       return new Response(JSON.stringify({ error: "Unauthorized" }), {
         status: 401,
         headers: { "Content-Type": "application/json" },
-      });
-    }
-
-    // CORS preflight
-    if (request.method === "OPTIONS") {
-      return new Response(null, {
-        headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-          "Access-Control-Allow-Headers": "Content-Type, Accept, Mcp-Session-Id",
-        },
       });
     }
 
