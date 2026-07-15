@@ -11,6 +11,7 @@ interface Env {
   DB: D1Database;
   API_KEY: string;
   LOGIN_RATE_LIMITER?: RateLimit;
+  BACKUPS: R2Bucket;
 }
 
 interface Memory {
@@ -489,7 +490,69 @@ function buildServer(env: Env, caller: Caller): McpServer {
     }
   );
 
+  // ── export_memories ────────────────────────────────────────────────────────
+  server.tool(
+    "export_memories",
+    "Export every memory your key can read as a JSON document — for backup or portability. Full content included.",
+    {},
+    async () => {
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM memories WHERE ${scope.clause} ORDER BY workspace, type, category, updated_at DESC`
+      )
+        .bind(...scope.params)
+        .all<Memory>();
+
+      const payload = JSON.stringify(
+        {
+          exported_at: new Date().toISOString(),
+          scope: caller.workspaces,
+          count: results.length,
+          memories: results,
+        },
+        null,
+        2
+      );
+
+      return { content: [{ type: "text" as const, text: payload }] };
+    }
+  );
+
   return server;
+}
+
+// ── Backups (R2) ──────────────────────────────────────────────────────────────
+// Full dump of the durable tables to R2. The cron trigger and the on-demand
+// admin route share this. Sessions are intentionally excluded — they are
+// ephemeral and regenerate on next login.
+
+async function runBackup(env: Env, at: number): Promise<{ key: string; memories: number; keys: number }> {
+  const [memories, apiKeys] = await Promise.all([
+    env.DB.prepare("SELECT * FROM memories ORDER BY workspace, type, category").all<Memory>(),
+    env.DB.prepare(
+      "SELECT id, key_hash, label, workspaces, can_write, created_at, last_used_at, revoked_at FROM api_keys ORDER BY created_at"
+    ).all<ApiKeyRow>(),
+  ]);
+
+  const iso = new Date(at).toISOString();
+  // 2026-07-15T03-00-00-000Z.json — sortable, colon-free for object keys.
+  const key = `memories/${iso.replace(/[:.]/g, "-")}.json`;
+
+  const body = JSON.stringify(
+    {
+      backed_up_at: iso,
+      schema_version: 3,
+      memories: memories.results,
+      api_keys: apiKeys.results, // hashes only — raw keys were never stored
+    },
+    null,
+    2
+  );
+
+  await env.BACKUPS.put(key, body, {
+    httpMetadata: { contentType: "application/json" },
+  });
+
+  return { key, memories: memories.results.length, keys: apiKeys.results.length };
 }
 
 // ── Admin: API key management (master key only) ──────────────────────────────
@@ -779,6 +842,20 @@ export default {
       return handleAdminKeys(request, env, url);
     }
 
+    // ── Admin: on-demand backup — master key only ─────────────────────────
+    // Same routine the cron runs, exposed so a backup can be forced and
+    // verified without waiting for the schedule.
+    if (url.pathname === "/admin/backup") {
+      if (!caller.isAdmin) {
+        return json({ error: "Forbidden — backups require the master key" }, 403);
+      }
+      if (request.method !== "POST") {
+        return json({ error: "Method not allowed" }, 405);
+      }
+      const result = await runBackup(env, Date.now());
+      return json({ ok: true, ...result }, 201);
+    }
+
     // MCP endpoint
     if (url.pathname !== "/mcp") {
       return new Response("Not found", { status: 404 });
@@ -791,5 +868,15 @@ export default {
 
     await server.connect(transport);
     return transport.handleRequest(request);
+  },
+
+  // Scheduled D1 → R2 backup (cron configured in wrangler.jsonc).
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      runBackup(env, event.scheduledTime).then(
+        (r) => console.log(`backup ok: ${r.key} (${r.memories} memories, ${r.keys} keys)`),
+        (err) => console.error("backup failed:", err)
+      )
+    );
   },
 };

@@ -13,6 +13,18 @@
     }
   ],
 
+  "r2_buckets": [
+    {
+      "binding": "BACKUPS",
+      "bucket_name": "brain-stellae-backups"
+    }
+  ],
+
+  // Daily backup of D1 → R2 at 03:00 UTC.
+  "triggers": {
+    "crons": ["0 3 * * *"]
+  },
+
   "routes": [
     {
       "pattern": "mcp.stellae.studio",

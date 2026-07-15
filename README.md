@@ -37,6 +37,7 @@ Memories are typed:
 | `update_memory` | Replace the content of an existing memory by ID. |
 | `delete_memory` | Delete a memory by ID. |
 | `list_memories` | List all memory IDs, types, workspaces, and categories — no full content. |
+| `export_memories` | Export every memory the key can read as a JSON document — for backup or portability. |
 
 All tools are automatically filtered by the calling key's workspace scope.
 
@@ -46,9 +47,41 @@ All tools are automatically filtered by the calling key's workspace scope.
 
 - **Runtime** — Cloudflare Workers (TypeScript)
 - **Database** — Cloudflare D1 (SQLite)
+- **Backups** — Cloudflare R2 (`brain-stellae-backups`)
 - **MCP SDK** — `@modelcontextprotocol/sdk`
 - **Validation** — Zod
 - **Deploy** — Wrangler
+
+---
+
+## Backups
+
+The full `memories` and `api_keys` tables are dumped to the R2 bucket `brain-stellae-backups` under `memories/<ISO-timestamp>.json`:
+
+- **On schedule** — a Worker cron trigger runs daily at **03:00 UTC** (`triggers.crons` in [wrangler.jsonc](wrangler.jsonc))
+- **On demand** — `POST /admin/backup` with the master key forces a backup immediately:
+  ```bash
+  curl -X POST https://mcp.stellae.studio/admin/backup -H "Authorization: Bearer $MASTER_KEY"
+  # → { "ok": true, "key": "memories/2026-07-15T…json", "memories": 13, "keys": 2 }
+  ```
+
+Backups contain API-key **hashes only** — raw keys are never stored anywhere. Set an R2 lifecycle rule on the bucket if you want to auto-expire old dumps.
+
+### Restore
+
+```bash
+# 1. Download a backup
+npx wrangler r2 object get brain-stellae-backups/memories/<timestamp>.json --file restore.json
+
+# 2. Turn it into INSERTs and load it (memories shown; api_keys analogous)
+node -e '
+  const d = require("./restore.json");
+  const esc = v => v == null ? "NULL" : `'"'"'${String(v).replace(/'"'"'/g,"'"'"''"'"'")}'"'"'`;
+  for (const m of d.memories)
+    console.log(`INSERT INTO memories (id,type,category,content,source,workspace,created_at,updated_at) VALUES (${[m.id,m.type,m.category,m.content,m.source,m.workspace,m.created_at,m.updated_at].map(esc).join(",")});`);
+' > restore.sql
+npx wrangler d1 execute brain-stellae --remote --file restore.sql
+```
 
 ---
 
