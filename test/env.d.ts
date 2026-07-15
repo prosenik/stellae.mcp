@@ -5,5 +5,6 @@ declare module "cloudflare:test" {
     DB: D1Database;
     API_KEY: string;
     TEST_MIGRATIONS: D1Migration[];
+    BACKUPS: R2Bucket;
   }
 }
