@@ -21,6 +21,11 @@ interface Memory {
   content: string;
   source: string | null;
   workspace: string;
+  tags: string | null;         // JSON array of strings
+  importance: number;          // 1..5
+  status: string;              // 'active' | 'archived' | 'pending'
+  review_after: string | null; // ISO date
+  related_ids: string | null;  // JSON array of memory ids
   created_at: string;
   updated_at: string;
 }
@@ -56,6 +61,25 @@ interface SessionRow {
 const SESSION_TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
 
 const WORKSPACE_RE = /^(private|agency|client:[a-z0-9][a-z0-9-]*)$/;
+// ISO date (YYYY-MM-DD) or full ISO datetime.
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/;
+
+// Compact importance marker for list/recall output, e.g. ★★★☆☆.
+function importanceStars(n: number): string {
+  const clamped = Math.max(1, Math.min(5, n));
+  return "★".repeat(clamped) + "☆".repeat(5 - clamped);
+}
+
+// Safely parse a stored JSON-array column (tags, related_ids) to string[].
+function parseJsonArray(raw: string | null): string[] {
+  if (!raw) return [];
+  try {
+    const v = JSON.parse(raw);
+    return Array.isArray(v) ? v.map(String) : [];
+  } catch {
+    return [];
+  }
+}
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -212,7 +236,7 @@ function defaultWorkspace(caller: Caller): string | null {
 function buildServer(env: Env, caller: Caller): McpServer {
   const server = new McpServer({
     name: "mcp.stellae.studio",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   const scope = scopeFilter(caller);
@@ -250,8 +274,9 @@ function buildServer(env: Env, caller: Caller): McpServer {
     "Get a full structured briefing about Stellae Studio — projects, agent pipeline, preferences, and key context. Scoped to the workspaces your key can read. Call this at the start of every session.",
     {},
     async () => {
+      // Only active memories reach a briefing — archived/pending are excluded.
       const { results } = await env.DB.prepare(
-        `SELECT * FROM memories WHERE ${scope.clause} ORDER BY workspace, type, category, updated_at DESC`
+        `SELECT * FROM memories WHERE ${scope.clause} AND status = 'active' ORDER BY workspace, type, importance DESC, category, updated_at DESC`
       )
         .bind(...scope.params)
         .all<Memory>();
@@ -302,8 +327,28 @@ function buildServer(env: Env, caller: Caller): McpServer {
         .regex(WORKSPACE_RE, "Must be 'private', 'agency', or 'client:<slug>'")
         .optional()
         .describe("Workspace this memory belongs to: 'private' | 'agency' | 'client:<slug>'. Defaults to your key's workspace."),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("Cross-cutting labels, e.g. ['design-system', 'billing', 'urgent']"),
+      importance: z
+        .number()
+        .int()
+        .min(1)
+        .max(5)
+        .optional()
+        .describe("1 (trivial) to 5 (critical). Drives briefing ranking. Defaults to 3."),
+      review_after: z
+        .string()
+        .regex(ISO_DATE_RE, "Must be an ISO date, e.g. '2026-12-31'")
+        .optional()
+        .describe("ISO date after which this memory should be re-verified. Omit for evergreen facts."),
+      related_ids: z
+        .array(z.string())
+        .optional()
+        .describe("IDs of related memories (e.g. link a decision to its project)."),
     },
-    async ({ type, category, content, source, workspace }) => {
+    async ({ type, category, content, source, workspace, tags, importance, review_after, related_ids }) => {
       if (!caller.canWrite) {
         return { content: [{ type: "text" as const, text: "✗ This API key is read-only." }] };
       }
@@ -323,13 +368,26 @@ function buildServer(env: Env, caller: Caller): McpServer {
       const id = crypto.randomUUID();
       const now = new Date().toISOString();
       await env.DB.prepare(
-        "INSERT INTO memories (id, type, category, content, source, workspace, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO memories (id, type, category, content, source, workspace, tags, importance, status, review_after, related_ids, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)"
       )
-        .bind(id, type, category, content, source ?? null, target, now, now)
+        .bind(
+          id,
+          type,
+          category,
+          content,
+          source ?? null,
+          target,
+          tags && tags.length ? JSON.stringify(tags) : null,
+          importance ?? 3,
+          review_after ?? null,
+          related_ids && related_ids.length ? JSON.stringify(related_ids) : null,
+          now,
+          now
+        )
         .run();
 
       return {
-        content: [{ type: "text" as const, text: `✓ Memory stored.\nID: ${id}\nType: ${type} / ${category}\nWorkspace: ${target}` }],
+        content: [{ type: "text" as const, text: `✓ Memory stored.\nID: ${id}\nType: ${type} / ${category}\nWorkspace: ${target}\nImportance: ${importanceStars(importance ?? 3)}${tags && tags.length ? `\nTags: ${tags.join(", ")}` : ""}` }],
       };
     }
   );
@@ -337,7 +395,7 @@ function buildServer(env: Env, caller: Caller): McpServer {
   // ── recall ────────────────────────────────────────────────────────────────
   server.tool(
     "recall",
-    "Search memories by keyword, category, or type. Only searches workspaces your key can read.",
+    "Search memories by keyword, category, or type. Only searches workspaces your key can read. Returns active memories by default.",
     {
       query: z.string().describe("Search term — matches against content and category"),
       type: z
@@ -349,8 +407,23 @@ function buildServer(env: Env, caller: Caller): McpServer {
         .regex(WORKSPACE_RE, "Must be 'private', 'agency', or 'client:<slug>'")
         .optional()
         .describe("Narrow the search to a single workspace"),
+      tags: z
+        .array(z.string())
+        .optional()
+        .describe("Only return memories carrying at least one of these tags"),
+      min_importance: z
+        .number()
+        .int()
+        .min(1)
+        .max(5)
+        .optional()
+        .describe("Only return memories with importance ≥ this (1–5)"),
+      status: z
+        .enum(["active", "archived", "pending"])
+        .optional()
+        .describe("Filter by status. Defaults to 'active' — archived/pending are hidden unless requested."),
     },
-    async ({ query, type, workspace }) => {
+    async ({ query, type, workspace, tags, min_importance, status }) => {
       if (workspace && !canAccessWorkspace(caller, workspace)) {
         return {
           content: [{ type: "text" as const, text: `✗ This API key has no access to workspace '${workspace}'.` }],
@@ -358,7 +431,10 @@ function buildServer(env: Env, caller: Caller): McpServer {
       }
 
       let sql = `SELECT * FROM memories WHERE ${scope.clause} AND (content LIKE ? OR category LIKE ?)`;
-      const params: string[] = [...scope.params, `%${query}%`, `%${query}%`];
+      const params: (string | number)[] = [...scope.params, `%${query}%`, `%${query}%`];
+
+      sql += " AND status = ?";
+      params.push(status ?? "active");
 
       if (type) {
         sql += " AND type = ?";
@@ -368,7 +444,17 @@ function buildServer(env: Env, caller: Caller): McpServer {
         sql += " AND workspace = ?";
         params.push(workspace);
       }
-      sql += " ORDER BY updated_at DESC LIMIT 20";
+      if (min_importance) {
+        sql += " AND importance >= ?";
+        params.push(min_importance);
+      }
+      if (tags && tags.length) {
+        // Match any requested tag against the JSON array (substring is safe
+        // enough for a keyword search; FTS lands in task 5).
+        sql += " AND (" + tags.map(() => "tags LIKE ?").join(" OR ") + ")";
+        for (const t of tags) params.push(`%"${t}"%`);
+      }
+      sql += " ORDER BY importance DESC, updated_at DESC LIMIT 20";
 
       const { results } = await env.DB.prepare(sql).bind(...params).all<Memory>();
 
@@ -379,7 +465,11 @@ function buildServer(env: Env, caller: Caller): McpServer {
       }
 
       const text = results
-        .map((m) => `[${m.id}]\n**${m.type} / ${m.category}** · _${m.workspace}_\n${m.content}${m.source ? `\n_Source: ${m.source}_` : ""}`)
+        .map((m) => {
+          const tagList = parseJsonArray(m.tags);
+          const meta = `_${m.workspace}_ · ${importanceStars(m.importance)}${tagList.length ? ` · 🏷 ${tagList.join(", ")}` : ""}`;
+          return `[${m.id}]\n**${m.type} / ${m.category}** · ${meta}\n${m.content}${m.source ? `\n_Source: ${m.source}_` : ""}`;
+        })
         .join("\n\n---\n\n");
 
       return { content: [{ type: "text" as const, text: `Found ${results.length} result(s):\n\n${text}` }] };
@@ -440,10 +530,62 @@ function buildServer(env: Env, caller: Caller): McpServer {
     }
   );
 
+  // ── archive_memory ─────────────────────────────────────────────────────────
+  server.tool(
+    "archive_memory",
+    "Archive a memory by ID — the preferred, reversible alternative to delete_memory. Archived memories drop out of briefings and default recall but are kept and can be restored.",
+    {
+      id: z.string().describe("Memory ID to archive"),
+    },
+    async ({ id }) => {
+      if (!caller.canWrite) {
+        return { content: [{ type: "text" as const, text: "✗ This API key is read-only." }] };
+      }
+
+      const now = new Date().toISOString();
+      const result = await env.DB.prepare(
+        `UPDATE memories SET status = 'archived', updated_at = ? WHERE id = ? AND ${scope.clause} AND status != 'archived'`
+      )
+        .bind(now, id, ...scope.params)
+        .run();
+
+      if (result.meta.changes === 0) {
+        return { content: [{ type: "text" as const, text: `No active memory found with ID: ${id}` }] };
+      }
+      return { content: [{ type: "text" as const, text: `✓ Memory archived. Use restore_memory to bring it back.` }] };
+    }
+  );
+
+  // ── restore_memory ─────────────────────────────────────────────────────────
+  server.tool(
+    "restore_memory",
+    "Restore an archived memory by ID, making it active again.",
+    {
+      id: z.string().describe("Memory ID to restore"),
+    },
+    async ({ id }) => {
+      if (!caller.canWrite) {
+        return { content: [{ type: "text" as const, text: "✗ This API key is read-only." }] };
+      }
+
+      const now = new Date().toISOString();
+      const result = await env.DB.prepare(
+        `UPDATE memories SET status = 'active', updated_at = ? WHERE id = ? AND ${scope.clause} AND status = 'archived'`
+      )
+        .bind(now, id, ...scope.params)
+        .run();
+
+      if (result.meta.changes === 0) {
+        return { content: [{ type: "text" as const, text: `No archived memory found with ID: ${id}` }] };
+      }
+      return { content: [{ type: "text" as const, text: `✓ Memory restored to active.` }] };
+    }
+  );
+
   // ── list_memories ─────────────────────────────────────────────────────────
   server.tool(
     "list_memories",
-    "List all stored memories with IDs, types, workspaces, and categories (no full content). Use to get an overview or find IDs.",
+    "List stored memories with IDs, types, workspaces, importance, and categories (no full content). Use to get an overview or find IDs. Lists active memories by default.",
     {
       type: z
         .enum(["user", "project", "feedback", "reference"])
@@ -454,16 +596,20 @@ function buildServer(env: Env, caller: Caller): McpServer {
         .regex(WORKSPACE_RE, "Must be 'private', 'agency', or 'client:<slug>'")
         .optional()
         .describe("Filter by workspace"),
+      status: z
+        .enum(["active", "archived", "pending"])
+        .optional()
+        .describe("Filter by status. Defaults to 'active'; pass 'archived' to find memories to restore."),
     },
-    async ({ type, workspace }) => {
+    async ({ type, workspace, status }) => {
       if (workspace && !canAccessWorkspace(caller, workspace)) {
         return {
           content: [{ type: "text" as const, text: `✗ This API key has no access to workspace '${workspace}'.` }],
         };
       }
 
-      let sql = `SELECT id, type, category, workspace, updated_at FROM memories WHERE ${scope.clause}`;
-      const params: string[] = [...scope.params];
+      let sql = `SELECT id, type, category, workspace, importance, status, updated_at FROM memories WHERE ${scope.clause} AND status = ?`;
+      const params: string[] = [...scope.params, status ?? "active"];
       if (type) {
         sql += " AND type = ?";
         params.push(type);
@@ -472,21 +618,21 @@ function buildServer(env: Env, caller: Caller): McpServer {
         sql += " AND workspace = ?";
         params.push(workspace);
       }
-      sql += " ORDER BY workspace, type, category";
+      sql += " ORDER BY workspace, type, importance DESC, category";
 
       const { results } = await env.DB.prepare(sql)
         .bind(...params)
-        .all<Pick<Memory, "id" | "type" | "category" | "workspace" | "updated_at">>();
+        .all<Pick<Memory, "id" | "type" | "category" | "workspace" | "importance" | "status" | "updated_at">>();
 
       if (results.length === 0) {
-        return { content: [{ type: "text" as const, text: "No memories stored yet." }] };
+        return { content: [{ type: "text" as const, text: `No ${status ?? "active"} memories.` }] };
       }
 
       const text = results
-        .map((m) => `[${m.id}] ${m.workspace} · ${m.type} / ${m.category} · ${m.updated_at}`)
+        .map((m) => `[${m.id}] ${m.workspace} · ${m.type} / ${m.category} · ${importanceStars(m.importance)} · ${m.updated_at}`)
         .join("\n");
 
-      return { content: [{ type: "text" as const, text: `${results.length} memories:\n\n${text}` }] };
+      return { content: [{ type: "text" as const, text: `${results.length} ${status ?? "active"} memories:\n\n${text}` }] };
     }
   );
 
@@ -813,7 +959,7 @@ export default {
       if (!caller) return loginPage();
       const scope = scopeFilter(caller);
       const { results } = await env.DB.prepare(
-        `SELECT * FROM memories WHERE ${scope.clause} ORDER BY type, category, updated_at DESC`
+        `SELECT * FROM memories WHERE ${scope.clause} AND status = 'active' ORDER BY type, importance DESC, category, updated_at DESC`
       )
         .bind(...scope.params)
         .all<Memory>();

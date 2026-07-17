@@ -25,18 +25,22 @@ Memories are typed:
 - `agency` — Stellae Studio internal context (the default)
 - `client:<slug>` — per-client scopes, e.g. `client:lelo`
 
+Every memory also carries metadata: **tags** (JSON labels), **importance** (1–5, drives briefing ranking), **status** (`active` / `archived` / `pending`), an optional **review_after** date, and **related_ids** linking it to other memories. Only `active` memories appear in briefings and default recall.
+
 ---
 
 ## MCP Tools
 
 | Tool | Description |
 |---|---|
-| `get_briefing` | Returns a full structured briefing — all memories the calling key can read, grouped by workspace and type. Call at session start. |
-| `remember` | Store a new memory (type, category, content, optional source and workspace). |
-| `recall` | Search memories by keyword, optionally filtered by type/workspace. |
+| `get_briefing` | Returns a full structured briefing — active memories the calling key can read, grouped by workspace and type, ranked by importance. Call at session start. |
+| `remember` | Store a new memory (type, category, content; optional source, workspace, tags, importance, review_after, related_ids). |
+| `recall` | Search memories by keyword, optionally filtered by type/workspace/tags/min_importance/status. |
 | `update_memory` | Replace the content of an existing memory by ID. |
-| `delete_memory` | Delete a memory by ID. |
-| `list_memories` | List all memory IDs, types, workspaces, and categories — no full content. |
+| `archive_memory` | Archive a memory by ID — the preferred, reversible removal path. Archived memories leave briefings and default recall. |
+| `restore_memory` | Restore an archived memory to active. |
+| `delete_memory` | Permanently delete a memory by ID (destructive — prefer `archive_memory`). |
+| `list_memories` | List memory IDs, types, workspaces, importance, and categories — no full content. Active by default. |
 | `export_memories` | Export every memory the key can read as a JSON document — for backup or portability. |
 
 All tools are automatically filtered by the calling key's workspace scope.
